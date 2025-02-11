@@ -1,31 +1,36 @@
 /*
  * filejoin.c
  *
- * Reassembles chunk files into a single output file.
- * It expects chunks to be named: <base_name>.partNNN (NNN = 0, 1, 2, ...).
- * After joining, it computes the SHA256 of the output file and compares it to the hash
- * read from the provided hash file.
+ * Reassembles encrypted chunk files into a single output file.
+ * It expects encrypted chunks to be named: <base_name>.partNNN (NNN = 0, 1, 2, ...).
+ * Each chunk file begins with a 16-byte IV.
+ * The encryption key is read from the provided key file.
+ * After joining and decryption, the SHA256 hash of the output file is computed and compared to the hash
+ * stored in the provided hash file.
  *
  * Compile with:
  *   gcc -o filejoin filejoin.c -lcrypto
  *
  * Usage:
- *   ./filejoin <base_name> <num_chunks> <output_file> <hash_file>
+ *   ./filejoin <base_name> <num_chunks> <output_file> <hash_file> <key_file>
  *
  * Example:
- *   ./filejoin mylargefile.bin 10 reassembled.bin mylargefile.bin.sha256
+ *   ./filejoin mylargefile.bin 10 reassembled.bin mylargefile.bin.sha256 mykey.txt
  */
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
 #include <openssl/sha.h>
+#include <openssl/evp.h>
+#include <openssl/rand.h>
 
 #define BUFFER_SIZE 8192
+#define KEY_SIZE 32    // 256-bit key for AES-256
+#define IV_SIZE 16     // 16 bytes for AES block size
 
-/* Compute the SHA256 hash of a file.
- * The result (32 bytes) is stored in the 'hash' array.
- */
+/* Compute SHA256 hash of a file. */
 int compute_sha256(const char *filename, unsigned char hash[SHA256_DIGEST_LENGTH]) {
     FILE *f = fopen(filename, "rb");
     if (!f) {
@@ -58,9 +63,7 @@ int compute_sha256(const char *filename, unsigned char hash[SHA256_DIGEST_LENGTH
     return 0;
 }
 
-/* Convert a 32-byte hash into a hexadecimal string.
- * The 'output' buffer must be at least (SHA256_DIGEST_LENGTH * 2 + 1) bytes.
- */
+/* Convert a 32-byte hash into a hexadecimal string. */
 void hash_to_string(unsigned char hash[SHA256_DIGEST_LENGTH], char *output) {
     for (int i = 0; i < SHA256_DIGEST_LENGTH; i++) {
         sprintf(output + (i * 2), "%02x", hash[i]);
@@ -68,18 +71,43 @@ void hash_to_string(unsigned char hash[SHA256_DIGEST_LENGTH], char *output) {
     output[SHA256_DIGEST_LENGTH * 2] = '\0';
 }
 
-/* Reassemble the file from chunks.
- * It expects chunk files named: <base_name>.partNNN for NNN=0 .. num_chunks-1.
- * After reassembly, the SHA256 of the output file is computed and compared to the hash read from 'hash_filename'.
+/* Load the encryption key from the key file.
+ * The key file should contain a 64-character hexadecimal string.
  */
-int join_files(const char *base_name, int num_chunks, const char *output_filename, const char *hash_filename) {
+int load_key(const char *key_filename, unsigned char key[KEY_SIZE]) {
+    FILE *kf = fopen(key_filename, "r");
+    if (!kf) {
+        perror("fopen key file");
+        return -1;
+    }
+    char hexkey[KEY_SIZE * 2 + 1];
+    if (fgets(hexkey, sizeof(hexkey), kf) == NULL) {
+        fclose(kf);
+        fprintf(stderr, "Error reading key file.\n");
+        return -1;
+    }
+    fclose(kf);
+    for (int i = 0; i < KEY_SIZE; i++) {
+        unsigned int byte;
+        if (sscanf(&hexkey[i*2], "%2x", &byte) != 1) {
+            fprintf(stderr, "Invalid key format in key file.\n");
+            return -1;
+        }
+        key[i] = (unsigned char) byte;
+    }
+    printf("Encryption key loaded from %s\n", key_filename);
+    return 0;
+}
+
+/* Reassemble and decrypt the file from the encrypted chunks. */
+int join_files(const char *base_name, int num_chunks, const char *output_filename,
+               const char *hash_filename, const unsigned char key[KEY_SIZE]) {
     FILE *out = fopen(output_filename, "wb");
     if (!out) {
         perror("fopen output file");
         return 1;
     }
 
-    unsigned char buffer[BUFFER_SIZE];
     for (int i = 0; i < num_chunks; i++) {
         char chunk_filename[1024];
         snprintf(chunk_filename, sizeof(chunk_filename), "%s.part%03d", base_name, i);
@@ -89,10 +117,47 @@ int join_files(const char *base_name, int num_chunks, const char *output_filenam
             fclose(out);
             return 1;
         }
+
+        /* Read the IV from the beginning of the chunk file */
+        unsigned char iv[IV_SIZE];
+        if (fread(iv, 1, IV_SIZE, in) != IV_SIZE) {
+            fprintf(stderr, "Error reading IV from %s\n", chunk_filename);
+            fclose(in);
+            fclose(out);
+            return 1;
+        }
+
+        /* Initialize the decryption context */
+        EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
+        if (!ctx) {
+            fprintf(stderr, "Error creating decryption context.\n");
+            fclose(in);
+            fclose(out);
+            return 1;
+        }
+        if (EVP_DecryptInit_ex(ctx, EVP_aes_256_cbc(), NULL, key, iv) != 1) {
+            fprintf(stderr, "Error initializing decryption.\n");
+            EVP_CIPHER_CTX_free(ctx);
+            fclose(in);
+            fclose(out);
+            return 1;
+        }
+
+        unsigned char inbuf[BUFFER_SIZE];
+        unsigned char outbuf[BUFFER_SIZE + EVP_CIPHER_block_size(EVP_aes_256_cbc())];
+        int outlen;
         size_t n;
-        while ((n = fread(buffer, 1, BUFFER_SIZE, in)) > 0) {
-            if (fwrite(buffer, 1, n, out) != n) {
-                perror("fwrite");
+        while ((n = fread(inbuf, 1, BUFFER_SIZE, in)) > 0) {
+            if (EVP_DecryptUpdate(ctx, outbuf, &outlen, inbuf, n) != 1) {
+                fprintf(stderr, "Decryption update error.\n");
+                EVP_CIPHER_CTX_free(ctx);
+                fclose(in);
+                fclose(out);
+                return 1;
+            }
+            if (fwrite(outbuf, 1, outlen, out) != (size_t)outlen) {
+                perror("fwrite decrypted data");
+                EVP_CIPHER_CTX_free(ctx);
                 fclose(in);
                 fclose(out);
                 return 1;
@@ -100,15 +165,31 @@ int join_files(const char *base_name, int num_chunks, const char *output_filenam
         }
         if (ferror(in)) {
             perror("fread");
+            EVP_CIPHER_CTX_free(ctx);
             fclose(in);
             fclose(out);
             return 1;
         }
+        if (EVP_DecryptFinal_ex(ctx, outbuf, &outlen) != 1) {
+            fprintf(stderr, "Decryption finalization error or bad padding in %s.\n", chunk_filename);
+            EVP_CIPHER_CTX_free(ctx);
+            fclose(in);
+            fclose(out);
+            return 1;
+        }
+        if (fwrite(outbuf, 1, outlen, out) != (size_t)outlen) {
+            perror("fwrite final decrypted data");
+            EVP_CIPHER_CTX_free(ctx);
+            fclose(in);
+            fclose(out);
+            return 1;
+        }
+        EVP_CIPHER_CTX_free(ctx);
         fclose(in);
-        printf("Merged chunk: %s\n", chunk_filename);
+        printf("Merged and decrypted chunk: %s\n", chunk_filename);
     }
     fclose(out);
-    printf("File reassembly complete. Output file: %s\n", output_filename);
+    printf("File reassembly and decryption complete. Output file: %s\n", output_filename);
 
     /* Compute SHA256 of the reassembled file */
     unsigned char hash[SHA256_DIGEST_LENGTH];
@@ -116,9 +197,9 @@ int join_files(const char *base_name, int num_chunks, const char *output_filenam
         fprintf(stderr, "Failed to compute SHA256 of reassembled file.\n");
         return 1;
     }
-    char hash_str[SHA256_DIGEST_LENGTH * 2 + 1];
-    hash_to_string(hash, hash_str);
-    printf("SHA256 (%s) = %s\n", output_filename, hash_str);
+    char computed_hash_str[SHA256_DIGEST_LENGTH * 2 + 1];
+    hash_to_string(hash, computed_hash_str);
+    printf("SHA256 (%s) = %s\n", output_filename, computed_hash_str);
 
     /* Read the original hash from the provided hash file */
     FILE *hash_file_ptr = fopen(hash_filename, "r");
@@ -132,11 +213,10 @@ int join_files(const char *base_name, int num_chunks, const char *output_filenam
         fclose(hash_file_ptr);
         return 1;
     }
-    /* Remove any trailing newline characters */
     original_hash_str[strcspn(original_hash_str, "\r\n")] = 0;
     fclose(hash_file_ptr);
 
-    if (strcmp(hash_str, original_hash_str) == 0) {
+    if (strcmp(computed_hash_str, original_hash_str) == 0) {
         printf("SHA256 hash matches the original file.\n");
     } else {
         printf("SHA256 hash does NOT match the original file!\n");
@@ -146,8 +226,8 @@ int join_files(const char *base_name, int num_chunks, const char *output_filenam
 }
 
 int main(int argc, char *argv[]) {
-    if (argc != 5) {
-        fprintf(stderr, "Usage: %s <base_name> <num_chunks> <output_file> <hash_file>\n", argv[0]);
+    if (argc != 6) {
+        fprintf(stderr, "Usage: %s <base_name> <num_chunks> <output_file> <hash_file> <key_file>\n", argv[0]);
         return 1;
     }
     const char *base_name = argv[1];
@@ -158,6 +238,11 @@ int main(int argc, char *argv[]) {
     }
     const char *output_filename = argv[3];
     const char *hash_filename = argv[4];
-    return join_files(base_name, num_chunks, output_filename, hash_filename);
+    const char *key_filename = argv[5];
+    unsigned char key[KEY_SIZE];
+    if (load_key(key_filename, key) != 0) {
+        fprintf(stderr, "Failed to load encryption key.\n");
+        return 1;
+    }
+    return join_files(base_name, num_chunks, output_filename, hash_filename, key);
 }
-
